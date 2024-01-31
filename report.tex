@@ -1,0 +1,1135 @@
+
+\documentclass{article}
+
+
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[margin=2cm]{geometry}
+\usepackage[utf8]{inputenc}
+
+\usepackage{amsmath, amssymb}
+\usepackage{caption}
+\usepackage{comment}
+\usepackage{derivative}
+\usepackage{float}
+\usepackage{minted}
+\usepackage{xcolor}
+
+\usepackage[colorlinks]{hyperref}  % ALWAYS load this package LAST
+
+
+\definecolor{LightGray}{gray}{0.9}
+
+
+\title{“Finding similar items” project \\ \small Algorithms for Massive Datasets}
+\author{Alessandro Di Gioacchino}
+\date{January 2024}
+
+
+\begin{document}
+
+  \maketitle
+
+  \tableofcontents
+
+  % \begin{comment}
+    % The project report, preferably written in LaTeX, will be evaluated
+    % according to the following criteria:
+    % - correctness of the general methodological approach,
+    % - replicability of the experiments,
+    % - correctness of the approach,
+    % - scalability of the proposed solution,
+    % - clarity of exposition.
+    %
+    % The report should contain the following information:
+    % - the chosen dataset, and the parts of the latter which have been
+    %   considered,
+    % - how data have been organized,
+    % - the applied pre-processing techniques,
+    % - the considered algorithms and their implementations,
+    % - how the proposed solution scales up with data size,
+    % - a description of the experiments,
+    % - comments and discussion on the experimental results.
+    %
+    %
+    % The report must also contain the following declaration: “I declare
+    % that this material, which I now submit for assessment, is entirely my
+    % own work and has not been taken from the work of others, save and to the
+    % extent that such work has been cited and acknowledged within the text of
+    % my work.
+    % I understand that plagiarism, collusion, and copying are grave and
+    % serious offenses in the university and accept the penalties that would be
+    % imposed should I engage in plagiarism, collusion or copying. This
+    % assignment, or any part of it, has not been previously submitted by me or
+    % any other person for assessment on this or any other course of study.”
+  % \end{comment}
+
+  \vspace*{\fill}
+  \textit{I declare that this material, which I now submit for assessment, is
+  entirely my own work and has not been taken from the work of others, save and
+  to the extent that such work has been cited and acknowledged within the text
+  of my work.} \\
+  \textit{I understand that plagiarism, collusion, and copying are grave and
+  serious offenses in the university and accept the penalties that would be
+  imposed should I engage in plagiarism, collusion or copying. This assignment,
+  or any part of it, has not been previously submitted by me or any other
+  person for assessment on this or any other course of study.}
+
+  \newpage
+
+  \section{Dataset}
+  The dataset is a subset of Yelp's businesses, reviews, and user data; the
+  considered version is.. \\
+  It contains five JSON files (for simplicity, the
+  \texttt{yelp\_academic\_dataset\_} common prefix is omitted):
+  \texttt{business}, \texttt{checkin}, \texttt{review}, \texttt{tip}, and
+  \texttt{user}; in particular, the one used in this project is
+  \texttt{review}, with a size of roughly five gigabytes. Only the first
+  \( 500000 \) lines of the file have been considered, and among these a
+  smaller random sample of \( 1000 \) elements has been extracted: this
+  workaround is required when working with the free version of Google Colab.
+  Although the entire dataset could fit within the provided \( 13 \) GB of RAM,
+  some operations of the Spark MapReduce framework would most likely timeout
+  (currently, a free Colab notebook can run for at most \( 12 \) hours). \\
+  The dataset has nine columns:
+  \begin{itemize}
+    \item \texttt{review\_id} is a unique string characterizing each review;
+    \item \texttt{user\_id} is a string characterizing the user who has written
+    the review – the same user can write different reviews;
+    \item \texttt{business\_id} is a string characterizing the business whose
+    review has been written – the same business can be reviewed multiple times;
+    \item \texttt{stars} is the overall rating the user has given to the
+    business in the specific review, ranging from one to five;
+    \item \texttt{useful}, \texttt{funny}, \texttt{cool} are the amounts of
+    respective reactions the review has received from users;
+    \item \texttt{text} is a string containing the review itself;
+    \item \texttt{date} says when the review has been written (or published).
+  \end{itemize}
+  Once again, only a subset of columns is relevant for the goal of finding
+  similar reviews: \texttt{review\_id} and \texttt{text}. Actually, only the
+  \texttt{text} column is necessary, as the items we are checking for
+  similarity of is the very text of these reviews; any review identifier could
+  be used to store the mapping between text and review, and indeed a simple
+  counter could be used in place of the alphanumeric \texttt{review\_id}. One
+  can argue the review text is enough to identify a review: unfortunately, it
+  requires further processing before being fed to the algorithm, and storing a
+  mapping between the raw and the processed version would be expensive.
+  Moreover, we do not have any guarantees on the uniqueness of review texts,
+  and in fact detecting duplicated reviews, which could be exploited to boost
+  the overall opinion of a business, is one of the purposes of finding similar
+  items.
+
+  \section{Pre-processing}
+  Before we consider the actual pre-processing, it should be mentioned that
+  both the flavors of sampling (with and without replacement) can be useful:
+  the former allows to explore a larger space, the latter is going to tell us
+  whether the algorithm implementation is correct. Indeed, if the result also
+  contains some exact duplicates, our confidence in the correctness of the
+  implementation increases. To this end, it is important to note we should not
+  use a standard sampling with replacement, because the probability of an
+  element to be drawn twice is very low (\( \slashfrac{ 1 }{ 500 } \)); we can
+  make sure some elements of the sample are duplicated with the following
+  approach.
+  \begin{enumerate}
+    \item Extract the initial sample of size \( s \);
+    \item fix some number \( a \leq \lfloor \slashfrac s 2 \rfloor \) of
+    elements to replace;
+    \item generate \( a \) pseudo-random numbers \( d_1, \, \dots, \, d_a \) in
+    \( [ 1, \, s ) \);
+    \item remove elements in positions \( d_1, \, \dots, \, d_a \) from the
+    sample;
+    \item duplicate elements in positions \( d_1 - 1, \, \dots, \, d_a - 1 \),
+    occupying the indexes that were freed in the previous step.
+  \end{enumerate}
+  This way we get a sample of size \( s \) with \( a \) duplicates. \\
+  The pre-processing techniques applied to the dataset are pretty standard when
+  working with text elements. \\
+  The first step is removing stop words, i.e. words that are filtered out
+  because they are not significant to our analysis. Keeping in mind that there
+  is no one-fits-all list of stop words, what was used in the project is the
+  list provided by package “Natural Language Toolkit” (\texttt{nltk}). Some
+  stop words contained in this list are \texttt i, \texttt{me}, \texttt{my},
+  \texttt{myself}, \dots \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    import nltk
+    from nltk.corpus import stopwords
+
+    nltk.download('stopwords')
+    stopwords.words('english')[:12]
+  \end{minted}
+  %
+  \begin{minted}[
+    frame=leftline,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    ]{python}
+    ['i',
+    'me',
+    'my',
+    'myself',
+    'we',
+    'our',
+    'ours',
+    'ourselves',
+    'you',
+    "you're",
+    "you've",
+    "you'll"]
+  \end{minted}
+  %
+  As we can see, it only contains lowercase letters, so we first need to apply
+  a transformation to the dataset, turning all letters in their lowercase
+  counterpart. Also, elements of the dataset are entire reviews, so we convert
+  them to list of words by splitting them on any white space character; this
+  also comes with the nice side effect of removing consecutive white space
+  characters. Finally we filter away stop words. \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    # Turn all letters to lowercase
+    id_txt_lower = id_txt_rdd.map(
+      lambda id_txt: (id_txt[0], id_txt[1].lower())
+    )
+
+    # Split reviews on any white space character
+    id_words_rdd = id_txt_lower.map(
+      lambda id_txt: (id_txt[0], id_txt[1].split())
+    )
+
+
+    def remove_stopwords(word_list: list[str]) -> list[str]:
+      no_stopwords = []
+
+      for word in word_list:
+        if word not in stopwords.words('english'):
+          no_stopwords.append(word)
+
+      return no_stopwords
+
+    # Remove stop words
+    no_stopwords_rdd = id_words_rdd.map(
+      lambda id_words: (id_words[0], remove_stopwords(id_words[1]))
+    )
+  \end{minted}
+  %
+  Further down the list, we notice stop words containing an apostrophe, such as
+  \texttt{you're}, \texttt{you've}, \texttt{you'll}: this is why punctuation
+  marks have not been removed right away. Now that the dataset no longer
+  contains such stop words, punctuation can be removed, and the procedure to
+  get rid of stop words is run again for good measure (in the previous
+  execution, some stop words could have been missed because adjacent to
+  punctuation). \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    import string
+
+
+    def remove_punctuation(word_list: list[str]) -> list[str]:
+      no_punctuation = []
+
+      for word in word_list:
+        no_punctuation.append(word.translate(
+          str.maketrans('', '', string.punctuation))
+        )
+
+      return no_punctuation
+
+    # Remove punctuation
+    no_punctuation = no_stopwords_rdd.map(
+      lambda id_words: (id_words[0], remove_punctuation(id_words[1]))
+    )
+  \end{minted}
+  %
+  Then we remove numeric characters, and we make the search space more uniform
+  by stemming words: once again, we leverage the “Natural Language Toolkit”
+  package to extract the \textit{root} of each word. For instance, the root of
+  word \textit{looking} is \textit{look}. \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    import re
+
+
+    def is_numeric(word: str) -> bool:
+      numeric_pattern = re.compile(r'^[0-9]+$')
+      return bool(numeric_pattern.match(word))
+
+    # Remove words containing numbers
+    no_numbers_rdd = no_stopwords.map(
+      lambda id_words: (
+        id_words[0],
+        [word for word in id_words[1] if not is_numeric(word)]
+      )
+    )
+  \end{minted}
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    from nltk.stem import PorterStemmer
+
+    nltk.download('punkt')
+    stemmer = PorterStemmer()
+
+    def to_stem(word_list: list[str]) -> list[str]:
+      stems = []
+
+      for word in word_list:
+      stems.append(stemmer.stem(word))
+
+      return stems
+
+
+    # Extract stem from words
+    stem_rdd = no_numbers_rdd.map(
+      lambda id_words: (id_words[0], to_stem(id_words[1]))
+    )
+  \end{minted}
+  %
+  The last pre-processing step requires to select shingles. There are different
+  examples of shingles, and the one used in this project is called
+  \textit{k-gram}. K-grams are windows with a size of \( k \) characters, that
+  slide over each review: for this reason we first need to join back together
+  words that belong to the same review, putting a single space between each of
+  them. \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    def join_words(word_list: list[str]) -> list[str]:
+      joined_words = ''
+
+      for word in word_list:
+        joined_words = joined_words + word
+        if word != word_list[-1]:
+          joined_words = joined_words + ' '
+
+        return joined_words
+
+    # Put words making up reviews back together
+    cleaned_rdd = stem_rdd.map(
+      lambda id_txt: (id_txt[0], join_words(id_txt[1]))
+    )
+  \end{minted}
+  %
+  The choice of \( k \) has a big impact on the algorithm that follows: we want
+  some \( k \) large enough that the probability of two reviews to contain the
+  same k-gram is negligible. In order to estimate this probability, we compute
+  the average length \( l \) of the reviews: say \( l = 555 \). We should
+  consider all the \( 26 \) letters of the English alphabet, but we take into
+  account that some of them have a very small frequency by pretending we only
+  have \( 20 \) different letters (or \( 19 \) letters, and a white space
+  character). Now we compute the average amount of times \( t \) we expect to
+  see a generic k-gram of length \( k \) over an alphabet of \( 20 \) letters:
+  \[
+    t = \frac{ l }{ { 20 }^k }
+  \]
+  Plugging in the value of \( l \) we got before,
+  \[
+    t = \frac{ 555 }{ { 20 }^k }
+  \]
+  Clearly, \( t \) decreases exponentially with \( k \): we could pick
+  \( k = { 10 }^5 \), but then the algorithm would most likely detect only
+  exact duplicates; instead, with some relatively small \( k \) such as
+  \( k = 4 \), we get
+  \begin{align*}
+    t
+    & = \frac{ 555 }{ { 20 }^4 } \\
+    & \approx 0.004
+  \end{align*}
+  This means that on average we expect to see the same shingle in four elements
+  when considering a sample of size \( 1000 \). \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    def extract_kgrams(s: str, k: int) -> list[str]:
+      kgrams = []
+
+      for i in range(len(s) - k + 1):
+        kgram = s[i : i + k]
+        kgrams.append(kgram)
+
+      return kgrams
+
+
+    k = 5
+
+    # Turn reviews into lists of k-grams
+    kgrams_rdd = cleaned_rdd.map(
+      lambda id_txt: (id_txt[0], extract_kgrams(id_txt[1], k))
+    )
+  \end{minted}
+  %
+  Finally, we can easily tell that not all possible combinations of
+  \( { 20 }^k \) characters form a meaningful word, or part of word: thus we
+  compress the representation of the k-grams by applying some hash function to
+  each of them, and use the resulting hash values instead of the k-grams
+  themselves. \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    import hashlib
+    from typing import Callable
+
+    # Family of hash functions depending on parameter `i`
+    def create_hash_function(i: int, result_size: int = 4):
+      salt = str(i).encode('utf-8')
+
+      def hash_string(input_string):
+        data = str(input_string).encode('utf-8') + salt
+        hashed = hashlib.sha256(data).hexdigest()
+
+        return hashed[:result_size]
+
+      return hash_string
+
+
+    def hash_kgrams(
+        kgrams: list[str], hash_func: Callable[[str], str]) -> list[str]:
+
+      hashed_kgrams = []
+
+      for kgram in kgrams:
+        hashed_kgrams.append(hash_func(kgram))
+
+      return hashed_kgrams
+
+
+    hash_func = create_hash_function(123)
+
+    # Hash shingles
+    hashed_kgrams = kgrams_rdd.map(
+        lambda kgram: (kgram[0], hash_kgrams(kgram[1], hash_func))
+    )
+  \end{minted}
+  %
+
+  \newpage
+  \section{Jaccard similarity}
+  Let \( \mathcal D_i \) and \( \mathcal D_j \) be two non-empty documents
+  encoded as sets of shingles. The Jaccard similarity
+  \( J \! : \mathcal X^2 \to [ 0, \, 1 ] \), with \( \mathcal X \) being the
+  space where \( \mathcal D_i \) and \( \mathcal D_j \) live, is defined as
+  \[
+    J ( \mathcal D_i, \, \mathcal D_j ) =
+    \frac{ \lvert \mathcal D_i \cap \mathcal D_j \rvert }{ \lvert \mathcal D_i \cup \mathcal D_j \rvert } \mathrm ,
+  \]
+  that is, the size of the intersection between \( \mathcal D_i \) and
+  \( \mathcal D_j \) over the size of the union between \( \mathcal D_i \) and
+  \( \mathcal D_j \). \\
+  If \( \mathcal D_i \) and \( \mathcal D_j \) have \emph{all} words in common,
+  i.e. \( \mathcal D_j = \mathcal D_i \), their Jaccard similarity is one:
+  \begin{align*}
+    \mathcal D_j = \mathcal D_i \implies J ( \mathcal D_i, \, \mathcal D_i )
+    & = \frac{ \lvert \mathcal D_i \cap \mathcal D_i \rvert }{ \lvert \mathcal D_i \cup \mathcal D_i \rvert } \\
+    & = \frac{ \lvert \mathcal D_i \rvert }{ \lvert \mathcal D_i \rvert } \\
+    & = 1
+  \end{align*}
+  On the other hand, if \( \mathcal D_i \) and \( \mathcal D_j \) have
+  \emph{no} words in common, i.e. \( \mathcal D_i \) and \( \mathcal D_j \) are
+  disjoint, their Jaccard similarity is zero:
+  \begin{align*}
+    \mathcal D_i, \, \mathcal D_j \text{ disjoint } \implies
+    J ( \mathcal D_i, \, \mathcal D_j )
+    & = \frac{ \lvert \mathcal D_i \cap \mathcal D_j \rvert }{ \lvert \mathcal D_i \cup \mathcal D_j \rvert } \\
+    & = \frac{ \lvert \emptyset \rvert }{ \lvert \mathcal D_i \cup \mathcal D_j \rvert } \\
+    & = 0
+  \end{align*}
+
+  \section{Characteristic matrix}
+  Given that k-grams are a set of sliding and overlapping windows, the amount
+  of space we would need to store them is much larger than what is needed to
+  store the original documents, even if the shingles are compressed. \\
+  To sidestep this issue, we can think in terms of matrices: instead of storing
+  k-grams, we build a boolean matrix the rows of which are indexed by document
+  identifiers, and the columns by all possible k-grams; element
+  \( ( i, \, j ) \) of this matrix is one if k-gram \( i \) appears in document
+  \( j \), zero otherwise. Such a matrix is called “characteristic matrix.”
+  %
+  \begin{figure}[H]
+    \[
+      \begin{array}{l|rrrrr}
+        & \mathcal D_1 & \mathcal D_2 & \mathcal D_3 & \mathcal D_4 & \dots \\
+        \hline
+        S_1 &   0 &   1 &   0 &   1 & \\
+        S_2 &   1 &   0 &   0 &   1 & \\
+        S_3 &   1 &   1 &   1 &   0 & \\
+        S_4 &   0 &   0 &   1 &   1 & \\
+        \vdots &     &     &     &     &
+      \end{array}
+    \]
+    \caption*{An example of characteristic matrix.}
+  \end{figure}
+  %
+  Now we could easily compute the Jaccard similarity of two documents by fixing
+  the corresponding columns and counting the amount \( x \) of rows where two
+  \( 1 \)'s appear: this is the size of the intersection between the documents;
+  then, we count the amount \( x + y \) of rows where one or two \( 1 \)'s
+  appear, which represents the size of the union between the documents, and
+  divide the former by the latter. For instance, if we only consider the four
+  shingles displayed in the example above,
+  \[
+    J ( \mathcal D_1, \, \mathcal D_2 ) = \frac{ 1 }{ 3 }
+  \]
+  since the \( S_3 \) row is the only one containing two \( 1 \)'s, while
+  \( S_1, S_2, S_3 \) contains at least a \( 1 \). \\
+  In practice, the characteristic matrix is usually very sparse, so we may
+  first want to compress it, possibly without forgoing the ability to compute a
+  reasonable approximation of the Jaccard similarity without having to undo the
+  compression. This is where the concept of MinHash can help us.
+
+  \section{MinHash}
+  MinHash is a function mapping documents to shingles. \\
+  The general schema for computing a MinHash function starts by applying some
+  permutation to the matrix rows, that is to the shingles.
+  %
+  \begin{figure}[H]
+    \[
+      \begin{array}{l|rrrrr}
+        & \mathcal D_1 & \mathcal D_2 & \mathcal D_3 & \mathcal D_4 & \dots \\
+        \hline
+        S_1 &   0 &   1 &   0 &   1 & \\
+        S_2 &   1 &   0 &   0 &   1 & \\
+        S_3 &   1 &   1 &   1 &   0 & \\
+        S_4 &   0 &   0 &   1 &   1 & \\
+        \vdots &     &     &     &     &
+      \end{array}
+      % \quad \underset{ \mathrm{permutation} }{ \longrightarrow } \quad
+      \quad \underset{ \sigma_1 }{ \longrightarrow } \quad
+      \begin{array}{l|rrrrr}
+        & \mathcal D_1 & \mathcal D_2 & \mathcal D_3 & \mathcal D_4 & \dots \\
+        \hline
+        S_2 &   1 &   0 &   0 &   1 & \\
+        S_1 &   0 &   1 &   0 &   1 & \\
+        S_3 &   1 &   1 &   1 &   0 & \\
+        S_4 &   0 &   0 &   1 &   1 & \\
+        \vdots &     &     &     &     &
+      \end{array}
+    \]
+    \caption*{
+      The characteristic matrix, before and after applying permutation
+      \( \sigma_1 \).
+    }
+  \end{figure}
+  %
+  Then, for each document we scan the corresponding column of the permuted
+  matrix, and stop at the first \( 1 \) we encounter: the row we are in is
+  indexed by some shingle, and this is the MinHash value of the document.
+  %
+  \begin{figure}[H]
+    \[
+      \begin{array}{l|lllll}
+        & D_1 & D_2 & D_3 & D_4 & \dots \\
+        \hline
+        \sigma_1 & S_2 & S_1 & S_3 & S_1 & \\
+      \end{array}
+    \]
+    \caption*{The result of applying a MinHash function once.}
+  \end{figure}
+  This process can be repeated a number of times, each time with a different
+  permutation.
+  %
+  \begin{figure}[H]
+    \[
+      \begin{array}{l|lllll}
+        & \mathcal D_1 & \mathcal D_2 & \mathcal D_3 & \mathcal D_4 & \dots \\
+        \hline
+        \sigma_1 & S_2 & S_1 & S_3 & S_1 & \\
+        \sigma_2 & S_3 & S_1 & S_4 & S_1 &
+      \end{array}
+    \]
+    \caption*{The result of applying MinHash twice.}
+  \end{figure}
+  %
+  The resulting matrix is called “signature matrix”: it has the same amount of
+  columns as the characteristic matrix, but a number of rows that is possibly
+  smaller, as it depends on how many permutations we have used. \\
+  Provided the permutations have been extracted uniformly at random among all
+  available permutations of shingles, the following holds:
+  \[
+    \mathbb P ( H ( \mathcal D_i ) = H ( \mathcal D_j ) ) =
+    J ( \mathcal D_i, \, \mathcal D_j ) \mathrm .
+  \]
+  That is, the Jaccard similarity between documents \( \mathcal D_i \) and
+  \( \mathcal D_j \) can be estimated with the probability that a random
+  MinHash function \( H \) computed on \( \mathcal D_i \) is the same as
+  \( H \) on \( \mathcal D_j \). In order to prove this, let us consider the
+  different type of rows we may encounter within the characteristic matrix.
+  \begin{itemize}
+    \item \( x \)-type rows: the row contains two \( 1 \)'s, so the
+    corresponding shingle belongs to both \( \mathcal D_i \) and
+    \( \mathcal D_j \)
+    \item \( y \)-type rows: the row contains one \( 1 \), so the shingle
+    belongs to either \( \mathcal D_i \) or \( \mathcal D_j \)
+    \item \( z \)-type rows: the row contains no \( 1 \), so the shingle
+    belongs to neither \( \mathcal D_i \) nor \( \mathcal D_j \)
+  \end{itemize}
+  Basically, fixed two documents and a row, we are considering all possible
+  combinations in which \( 0 \)'s and \( 1 \)'s may appear while ignoring their
+  relative order. \\
+  Now, let \( x, \, y, \, z \) be the number of \( x \)-, \( y \)-,
+  \( z \)-type rows respectively: we can compute the Jaccard similarity between
+  \( \mathcal D_i \) and \( \mathcal D_j \) as
+  \[
+    J ( \mathcal D_i, \, \mathcal D_j ) = \frac{ x }{ x + y }
+  \]
+  To compute probability
+  \( \mathbb P ( H ( \mathcal D_i ) = H ( \mathcal D_j ) ) \) instead, we
+  simply consider the structure of any MinHash function: the columns of the
+  characteristic matrix corresponding to \( \mathcal D_i \) and
+  \( \mathcal D_j \) are scanned until a \( 1 \) is found. The event
+  \( H ( \mathcal D_i ) = H ( \mathcal D_j ) \) holds whenever the same row
+  contains \( 1 \) in both columns, otherwise the scanning would just continue
+  for at least a column, and the value of \( H ( \mathcal D_i ) \) would be
+  different than that of \( H ( \mathcal D_j ) \). So we are interested in the
+  probability that the first non \( z \)-type row is of type \( x \): by
+  assumption, the permutations are drawn uniformly at random, so we can compute
+  the aforementioned probability via the relative frequency interpretation.
+  \[
+    \mathbb P ( H ( \mathcal D_i ) = H ( \mathcal D_j ) ) = \frac{ x }{ x + y }
+  \]
+  All in all, we have that
+  \[
+    \mathbb P ( H ( \mathcal D_i ) = H ( \mathcal D_j ) ) =
+    J ( \mathcal D_i, \, \mathcal D_j )
+  \]
+
+  Although the space problem is more or less taken care of, we still have a
+  time problem, as we need to compute the Jaccard similarity for all possible
+  pairs within a massive dataset. \\
+
+  Applying a MinHash function directly in big data contexts is a bad idea: not
+  only would we need to produce a permutation as big as the amount \( n \) of
+  rows in the characteristic matrix, but this would also need to be sorted
+  according to the permutation, a process which cannot happen faster than
+  \( n log ( n ) \). \\
+  Instead, we leverage hash functions once again. Just like before, the hash
+  function takes a shingle as input, and returns some bucket as output: in
+  order to avoid collisions, we would need a perfect hash function; moreover,
+  a family of hash functions is actually needed to avoid making the process too
+  slow. \\
+  At the beginning, we initialize the entire signature matrix with some big
+  number, e.g. \( + \infty \):
+  \[
+    \forall \, i = 1, \, \dots, \, I, \quad \forall \, c = 1, \, \dots, \, C
+    \qquad \mathrm{ sig } ( i, \, c ) = + \infty \mathrm ,
+  \]
+  where \( \mathrm{ sig } \) is the signature matrix of size \( I \times C \).
+  \\
+  Then, for each shingle in the characteristic matrix, we compute its hash
+  value according to all members of the family: if the corresponding entry of
+  the characteristic matrix is \( 1 \), we set the current element of the
+  signature matrix to the minimum between the current value and the hash value.
+  \\
+  Given the number \( R \) of shingles,
+  \( \forall \, r = 0, \, \dots, \, R - 1 \)
+  \begin{itemize}
+    \item compute \( h_i \, ( r ) \quad \forall \, i = 1, \, \dots, \, I \)
+    \item \( \forall \, c = 1, \, \dots, \, C \)
+    \begin{itemize}
+      \item[] if \( \mathrm{ char } ( r, \, c ) = 1 \):
+      \begin{itemize}
+        \item[] \( \forall \, i = 1, \, \dots, \, I \quad
+        \mathrm{ sig } ( i, \, c ) =
+        \min ( \mathrm{ sig } ( i, \, c ), h_i \, ( r ) ) \)
+      \end{itemize}
+    \end{itemize}
+  \end{itemize}
+  Albeit with some differences, related to the fact we do not actually need a
+  characteristic matrix, the following instructions can be used to apply a
+  MinHash function to the list of k-grams, exploiting the same hash family we
+  created earlier.
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    def min_hash(kgrams: list, i: int) -> int:
+      #   instantiate some hash function depending on `i` (which will be the
+      # current row index)
+      hash_func = create_hash_function(i)
+
+      # initialize the current element of the signature matrix
+      min_signature = float('inf')
+
+      for kgram in kgrams:
+        #   Turn the hash value, which can be interpreted as a hexadecimal
+        # number, into an integer
+        hash_signature = int(hash_func(kgram), 16)
+
+        # Replace the current element if the hash value is smaller
+        if hash_signature < min_signature:
+          min_signature = hash_signature
+
+      return min_signature
+
+
+      n = 192  # Number of elements in the signature matrix
+
+      signature_matrix = hashed_kgrams.map(
+        lambda hashed_kgram:
+        (hashed_kgram[0], [min_hash(hashed_kgram[1], i) for i in range(n)])
+      )
+  \end{minted}
+  %
+
+  \section[LSH]{Locality-sensitive hashing}
+  An approximate algorithm to solve the time problem is called
+  “locality-sensitive hashing”. \\
+  Given the signature matrix with \( n \) elements, we divide it into \( b \)
+  bands and \( r \) rows per band such that \( b \cdot r = n \).
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    # Type annotation has been omitted for simplicity
+    def divide_signature_matrix(doc_id_sig, b, r):
+      doc_id = doc_id_sig[0]
+      doc_sig = doc_id_sig[1]
+
+      hash_func = create_hash_function(123)
+
+      out = []
+
+      for i in range(b):
+        band_id = i
+        offset = i * r
+
+        column = ''.join(str(n) for n in doc_sig[offset : offset + r])
+        # Hash function that takes vectors of `r` integers
+        bucket_id = hash_func(column)
+
+        #   Same hash function for all the bands, separate bucket array for
+        # each band
+        key = (band_id, bucket_id)
+        out.append((key, doc_id))
+
+      return out
+  \end{minted}
+  %
+  Now we only select pairs of documents such that all their rows within at
+  least one band are the same: if we cannot find any such band, the documents
+  are most likely too different and their Jaccard similarity is very low; we do
+  not need to process them further. \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    #   Approximation: documents having at least the rows in one band in common
+    # surely hash to the same bucket, but there could be collisions depending
+    # on how close the hash function is to the perfect one
+    # `hashed_bands` is the output of `divide_signature_matrix`
+    candidates = hashed_bands.groupByKey().map(
+      lambda x: (x[0], list(x[1]))
+    )
+  \end{minted}
+  %
+  The probability for a pair to be selected depends on both \( b \) and
+  \( r \): in particular, it is \( 1 - ( 1 - s^r )^b \), \( s \) being the
+  probability \( \mathcal D_i \) and \( \mathcal D_j \) agree in one row, that
+  is their Jaccard similarity. To prove this, we note the probability of
+  \( \mathcal D_i \) and \( \mathcal D_j \) to agree in an entire band, made up
+  of \( r \) rows, is \( s^r \); the complementary event is that
+  \( \mathcal D_i \) and \( \mathcal D_j \) do not agree in one band, and its
+  probability is \( 1 - s^r \). The probability of \( \mathcal D_i \) and
+  \( \mathcal D_j \) not to agree in \textit{any} of the \( b \) bands is
+  \( ( 1 - s^r )^b \). Finally, the complementary of this event, i.e.
+  \( \mathcal D_i \) and \( \mathcal D_j \) agree in at least one band, has
+  probability \( p ( s ) := 1 - ( 1 - s^r )^b \). \\
+  Since we want to determine whether a pair is selected or not, we normally
+  apply some threshold to function \( p ( s ) \): this can be obtained by
+  considering whatever \( s \) causes the steepest change in the function
+  value, so we compute it by checking when the second derivative of
+  \( p( s ) \) is zero. Provided the number \( r \) of rows is large enough,
+  the \( s \) satisfying the property is
+  \[
+    \left ( \frac 1 b \right )^{ \slashfrac 1 r } \mathrm .
+  \]
+  The number \( n \) of rows in the signature matrix is fixed, so we have two
+  variables: either we choose some pair \( ( b, \, r ) \) whose
+  product is \( n \), or we choose \( s \) and compute the resulting
+  \( ( b, \, r ) \). The second approach is usually chosen in practice: we fix
+  some \( t \) so that only pairs of documents whose similarity is larger than
+  \( t \) are selected, and obtain the desired \( ( b, \, r ) \) as a result.
+  \\
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    def func(x):
+      b, r = x
+      eq1 = (1 / b)**(1 / r) - t
+      eq2 = b * r - n
+
+      return [eq1, eq2]
+
+    solutions = fsolve(func, [1, 1])
+    b_solution, r_solution = solutions
+  \end{minted}
+  %
+  Remember that LSH is a family of approximate algorithms: in other words, the
+  result we obtain can be different that the actual result. When it comes to
+  classification, which is the kind of problem we have to deal with after
+  introducing a threshold \( t \) on the similarity, this translates to the
+  presence of false positives and false negatives: the former are a set of
+  similar documents according to the approximate approach, but dissimilar
+  according to the exact approach; the latter are instead claimed to be
+  dissimilar by LSH, and are actually similar when following the exact
+  approach.
+
+  \newpage
+
+  \section{Scaling}
+  All operations discussed here, except of course for the initial loading of
+  the dataset, leverage the Apache Spark framework, and in particular its
+  implementation of \textbf resilient \textbf distributed \textbf datasets
+  (RDDs) and MapReduce. \\
+  Roughly speaking, the RDD is distributed across different nodes in a cluster
+  of machines, and each of them only works on its portion of the dataset. Only
+  operations compliant with the MapReduce framework can be executed on RDDs:
+  \texttt{map} transforms data, while \texttt{reduce} aggregates it. \\
+  The main focus of Spark is scalability, so if used correctly it should not
+  fall short. Unfortunately, exploiting clusters of machines means we have to
+  rely on some network, which becomes the main bottleneck: for this reason, the
+  so-called “shuffling” should be avoided as much as possible. Shuffling occurs
+  whenever the cluster nodes interact with each other across the network; the
+  most trivial example of shuffling occurs when we ask the RDD for its
+  contents: this requires all nodes to send their dataset portion to one
+  machine (the “driver”) before it can be displayed as a whole. \\
+  The free tier of Google Colab can never show such an issue, because the
+  cluster it provides us with is made up by a single node. This clearly
+  cripples the performance of Spark, so we have no other choice but to throw
+  away the majority of the dataset, retaining only a small fraction over which
+  the operations are performed. A first possibility of scaling is thus given by
+  the size of the dataset, as it could easily grow given a larger cluster. \\
+  Another interesting point is the following operation, by far the slowest one:
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    candidates = hashed_bands.groupByKey().map(
+      lambda x: (x[0], list(x[1]))
+    )
+  \end{minted}
+  %
+  We have already ruled out the possibility that this operation is so slow
+  because of shuffling, and we are left with \texttt{groupByKey} and
+  \texttt{map}: the first aggregates pairs \texttt x with the same key
+  \texttt{x[0]}, putting the corresponding \texttt{x[1]} into some
+  \texttt{Iterable}; the second then casts this \texttt{Iterable} into a
+  \texttt{list}. \texttt{groupByKey} is most likely the culprit: in order to
+  compute it, Spark first sorts the dataset by key; under normal conditions,
+  and with such a small dataset, this should not be cause of concern, but the
+  key is not a simple object, being a pair of integer and string. It could be
+  interesting to see how this operation translates in an actually distributed
+  scenario, where both sorting and shuffling happen.
+
+  \section{Experiments}
+  The remaining part of the experiment is pretty straightforward. Once we have
+  the lists of documents with all rows within at least one band in common, we
+  filter out any list with less than two elements, as they contain documents
+  whose similarity with the others is smaller than threshold \( t \).
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    filtered_candidates = candidates.filter(
+      lambda collision_list: len(collision_list[1]) > 1
+    )
+  \end{minted}
+  %
+  Starting from these lists, we extract pairs of candidate documents:
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    import itertools
+
+
+    def get_pairs(collisions_list: list) -> tuple:
+      pair_list = []
+
+      for pair in itertools.combinations(collisions_list, 2):
+        pair_list.append(pair)
+
+      return tuple(pair_list)
+
+
+    candidate_docs = filtered_candidates.flatMap(
+      lambda pairs: get_pairs(pairs[1])
+    ).distinct()
+  \end{minted}
+  %
+  Given these pairs of identifiers, we can easily retrieve the corresponding
+  documents from the original RDD. \\
+  In principle, the experiment could end here: if we were working on an
+  actually massive dataset, it would not be possible to compare the result of
+  the approximate algorithm with the one of the exact algorithm. Since we can,
+  we compute the Jaccard similarity between pairs of documents within the
+  signature matrix.
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    # `candidate_list` contains the identifier of all similar documents
+    filtered_signature_matrix = signature_matrix.filter(
+      lambda id_sig: id_sig[0] in candidate_list
+    )
+
+    # `filter` is needed to exclude pairs containing the same identifier
+    cartesian_product = (
+      filtered_signature_matrix.cartesian(filtered_signature_matrix)
+                               .filter(lambda id_minhash:
+                                       id_minhash[0][0] != id_minhash[1][0])
+    )
+
+    def jaccard_sim(set1: set, set2: set) -> float:
+      intersection_length = len(set1.intersection(set2))
+      union_length = len(set1.union(set2))
+
+      return float(intersection_length) / float(union_length)
+
+
+    #   Each triple within the following RDD contains two document identifiers
+    # and their Jaccard similarity
+    jaccard_rdd = cartesian_product.map(
+        lambda p: (p[0][0], p[1][0], jaccard_sim(set(p[0][1]), set(p[1][1])))
+    )
+  \end{minted}
+  %
+  Finally, we remove those pairs of documents whose Jaccard similarity is
+  smaller than threshold \( t \), and we compute the intersection between the
+  remaining pairs and the output of the approximate algorithm.
+  %
+  \begin{minted}[
+    frame=single,
+    framesep=2mm,
+    baselinestretch=1.2,
+    bgcolor=LightGray,
+    fontsize=\footnotesize,
+    linenos
+  ]{python}
+    similar_docs = jaccard_rdd.filter(lambda p: p[2] >= t)
+    lsh_jaccard_intersection = similar_docs.intersection(candidate_docs)
+  \end{minted}
+  %
+  On this particular dataset, the comparison between exact and approximate
+  algorithms is only possible with thresholds smaller than \( 0.6 \), as no
+  pair of reviews with a similarity of \( 0.7 \) exists (and there are only two
+  pairs with a similarity of \( 0.6 \)). \\
+  Even so, despite some attempts with different values of hyperparameters, the
+  intersection between results is empty when considering pairs of identifiers.
+
+  \section{Results}
+  The main takeaway of the experiments is that the dataset contains no
+  duplicates, at least in the small subset that was considered. \\
+  Fixing the length of \( k \)-grams to \( 5 \), the number of signatures per
+  review to \( 256 \) and the similarity threshold to \( 0.6 \), the most
+  similar pair of documents is the following. \\
+
+  \textbf{Review} \texttt{o5O3CYV79dTN8O9mFijmFA}: \\
+  «\textit{Finally went to Delicia! My boyfriend and I went there for date
+  night and had a fantastic time! At 7:15 on a Tuesday, the place was lively
+  but there was no wait for a table for 2. The decor is cool and romantic, the
+  host was very gracious, and our waiter, Shawn, was friendly and made good
+  recommendations. I loved my margarita, and my boyfriend's sangria was tasty -
+  nice and winey! I also tried the mojito. It was good... but tasted like
+  Double Mint gum to me - not in a bad way but not in a way I liked. If you
+  tasted the same thing, please, PLEASE message me so I feel less crazy!} \\
+
+  \textit{Anyway, the queso fundido appetizer was delicious and unique (the
+  chips were great too). For dinner, he got the beef empanadas and I got the
+  duck enchiladas. When we go back to Delicia again (and we will), I want to
+  try the scallops, but the duck enchiladas, rice and beans were so good it's
+  hard to imagine ordering anything else! My boyfriend really enjoyed the flaky
+  empanadas, as well. We chose wisely.} \\
+
+  \textit{Finally, we tried the Fire and Ice cocktail, about which I've heard
+  plenty of raves. Well, it wasn't really our thing. I mean, it's a quality
+  cocktail, and the chile ice ball is very cool, but it tastes like drinking
+  jalapenos! I guess some people like that, so power to them. But while I
+  didn't love the cocktail, I'm glad it's something you can get in Indy, you
+  know? Delicia is a great restaurant that helps take Indy's food and cocktail
+  scene up another notch.»} \\
+
+  \textbf{Review} \texttt{SbeoXuUHy1xgL-o7Urpkeg}: \\
+  «\textit{`Top donuts in the country?'} \\
+
+  \textit{Okay. Whenever I read something that says 'top ten blah blah of
+  something in the us or state of' my wife and I are extremely hesitant because
+  it sounds like a gimmick. After coming to experience this place first hand I
+  can understand why you would make that statement. We visited on a Thursday
+  10:30amish with a line of 5 people. They don't serve sliders until 11am and
+  this gave us a great opportunity to do both separately.} \\
+
+  \textit{Ambience:} \\
+  \textit{Alot of character and with a ton of regulars. They were on a first
+  name basis with half the people in the place. Located on magazine st in the
+  garden district. Artsy stuff. Nice street to walk, explore, and shop.} \\
+
+  \textit{Food:} \\
+  \textit{They categorize their donuts into 3 categories to simplify pricing.
+  Reg/fancy/more fancy. This is brilliant as it speeds up the ordering but they
+  still carry variety on their menu.} \\
+
+  \textit{Glazed donut 4/5} \\
+  \textit{This was a good, well balanced donut. Not overly sweet but had
+  characteristics of what you expect from a donut. I prefer my donuts a bit
+  under cooked but this didn't change the pillow like texture one would desire.
+  The glaze was delicate yet slept on the donut. It didn't over power it at
+  all.} \\
+
+  \textit{French Toast donut 5/5} \\
+  \textit{My wife had this one and was very surprised by the balance this donut
+  had. Generally, donuts are rich and over the top in these types of
+  establishments, but the donuts made here tasted like they had a plan and they
+  were going to make it their way and not please us the customer. I have alot
+  of respect for these places.} \\
+
+  \textit{Fried chicken slider 4/5} \\
+  \textit{Small in stature but tasty, balanced and filling. Don't let this
+  slider fool you. It makes a statement with all the pieces it carries: the
+  slaw was amazing, the chicken fried and seasoned properly, to the pickled
+  jalapeño. Great combination.} \\
+
+  \textit{Pork belly slider 3/5} \\
+  \textit{This slider is very popular among their clientele. Good slider.
+  Picked onion brings nice tart and cuts richness of the belly, the herbs
+  leaves brings a certain bitterness that contrasted the fattiness of the
+  belly. The belly itself was properly cooked. Slow roasted ahead of time then
+  heated up on the flat top for crust. Seasoned well and you get that
+  concentration of the cure. I would have had less of a dry brine imo, but
+  that's just me. My wife says I'm being picky.} \\
+
+  \textit{Drink:} \\
+  \textit{Cold brew. 4/5} \\
+  \textit{I enjoyed this and honestly had to settle for this. They normally
+  have the Nitro cold brew but it wasn't working today. On a Louisiana humid
+  sunny day there is nothing like proper iced coffee.} \\
+
+  \textit{Service:} \\
+  \textit{Friendly but for sure they cater to the locals. They aren't here for
+  tourists and they shouldn't baby the tourists. 5/5»} \\
+
+  We can easily tell these reviews are not so similar: the general opinion is
+  favorable and both talk about food (not all do), but one is concerned on the
+  menu of some restaurant, while the other focuses on donuts. Given how the
+  algorithm works, it is pretty normal that these reviews are different when in
+  human-readable form: we could have two reviews with \( 60\% \) of words in
+  common talking about completely different topics, but MinHash and locality
+  sensitive hashing would not pick up on that; instead, they would only
+  consider what makes them similar, and classify them as such if the threshold
+  is permissive enough. In any case, the similarity between the reviews above,
+  computed on the associated sets of signatures, is only \( 0.44 \) (despite
+  the threshold of \( 0.6 \)), meaning the algorithm too sees them are more
+  dissimilar than similar.
+
+  \subsection*{Possible extensions}
+  \textbf{Building a proper pipeline to easily run experiments}. The pipeline
+  could also feature a step of model selection, looking for hyperparameters
+  values that make the final result closer to the exact algorithm; of course,
+  this would only be possible for dataset whose size allows to compute Jaccard
+  similarity in a reasonable amount of time. Another option is to ignore
+  similarity levels, and search for those values of hyperparameters that lead
+  to the smallest difference between the set of similar pairs resulting from
+  the approximated algorithm, and the set of similar pairs resulting from the
+  exact algorithm. \\
+  \textbf{Trying out different ways to embed documents}. We have seen TF-IDF
+  can be leveraged instead of \( k \)-grams for making text documents easier to
+  work with. For instance, we could encode reviews as the top \( 10 \) words
+  ranked according to TF-IDF, or as the set of words whose TF-IDF exceeds a
+  fixed threshold; in both cases, an additional hyperparameter is required, so
+  the model selection step would require exponentially more time. Then it could
+  be interesting to compare the results yielded by these different approaches.
+
+\end{document}
